@@ -66,17 +66,49 @@ class ADMARWorkflow:
             st.error(f"Hunter error: {e}")
             return None, self.orchestrator.get_workflow_status()
         
-        # --- STAGE 2: PARSER (Unstructured -> Structured) ---
-        st.write("📝 **Stage 2: Converting to structured format...**")
+        # --- STAGE 2: PARSER (Fetch Content + Unstructured -> Structured) ---
+        st.write("📝 **Stage 2: Fetching content and converting to structured format...**")
         try:
-            collector = DataCollector()
-            collector.add_batch(structured_data)
-            raw_df = collector.get_dataframe()
-            
+            fetcher = WebContentFetcher(timeout=8)
+            all_frames = []
+
+            progress = st.progress(0)
+            for idx, record in enumerate(structured_data):
+                url = record.get('link', '')
+                source_label = record.get('title', url)
+
+                if url and url.startswith('http'):
+                    st.write(f"  🌐 Fetching: `{url[:80]}`")
+                    fetched = fetcher.process_url(url)
+
+                    if fetched['status'] == 'success':
+                        parsed_df = self.parser.parse_from_fetched(fetched)
+                        if not parsed_df.empty:
+                            parsed_df['_source_url'] = url
+                            parsed_df['_source_title'] = source_label
+                            all_frames.append(parsed_df)
+                            st.write(f"    ✅ Extracted {parsed_df.shape[0]} rows × {parsed_df.shape[1]} cols")
+                        else:
+                            st.write(f"    ⚠️ No structured data found in page")
+                    else:
+                        st.write(f"    ❌ Could not fetch URL")
+
+                progress.progress((idx + 1) / max(len(structured_data), 1))
+
+            if all_frames:
+                # Merge all frames (outer join so different schemas are preserved)
+                raw_df = pd.concat(all_frames, ignore_index=True, sort=False)
+            else:
+                # Fallback: metadata-only table (original behaviour)
+                st.warning("⚠️ No page content could be parsed. Falling back to metadata table.")
+                collector = DataCollector()
+                collector.add_batch(structured_data)
+                raw_df = collector.get_dataframe()
+
             if raw_df.empty:
                 self.orchestrator.set_error("Parser produced empty dataframe")
                 return None, self.orchestrator.get_workflow_status()
-            
+
             st.write(f"✅ Created dataframe: {raw_df.shape[0]} rows × {raw_df.shape[1]} columns")
             self.orchestrator.parser_complete(raw_df.to_json())
         except Exception as e:
